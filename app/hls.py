@@ -34,6 +34,13 @@ class PlaylistSegment:
     duration_ms: int
     start_ms: Optional[int]
     uri: str
+    #: Sequence number of the segment whose PDT this start was taken or
+    #: derived from (the segment itself when it carries its own PDT).
+    anchor_seq: Optional[int] = None
+    #: The anchor segment's own PDT, i.e. the UTC instant the derivation
+    #: was based on.  ``None`` together with ``anchor_seq`` when the start
+    #: could not be resolved at all.
+    anchor_pdt_ms: Optional[int] = None
 
     @property
     def end_ms(self) -> Optional[int]:
@@ -136,14 +143,17 @@ def parse_media_playlist(text: str, base_url: str) -> MediaPlaylist:
             if pending_duration is None:
                 raise ValueError(f"segment URI without EXTINF: {line!r}")
             seq = media_sequence + len(segments)
-            segments.append(
-                PlaylistSegment(
-                    seq=seq,
-                    duration_ms=pending_duration,
-                    start_ms=pending_start,
-                    uri=urljoin(base_url, line),
-                )
+            segment = PlaylistSegment(
+                seq=seq,
+                duration_ms=pending_duration,
+                start_ms=pending_start,
+                uri=urljoin(base_url, line),
             )
+            if pending_start is not None:
+                # A segment with its own PDT is its own anchor.
+                segment.anchor_seq = seq
+                segment.anchor_pdt_ms = pending_start
+            segments.append(segment)
             pending_duration = None
             pending_start = None
 
@@ -158,17 +168,26 @@ def parse_media_playlist(text: str, base_url: str) -> MediaPlaylist:
 
 
 def _fill_missing_starts(segments: list[PlaylistSegment]) -> None:
-    """Derive PDT-less segment starts from neighbours and durations."""
+    """Derive PDT-less segment starts from neighbours and durations.
+
+    The derived segment inherits the anchor of the segment it was derived
+    from, so the archive can later trace exactly which PDT line a segment
+    start depends on.
+    """
     for index in range(1, len(segments)):
         current = segments[index]
         previous = segments[index - 1]
         if current.start_ms is None and previous.start_ms is not None:
             current.start_ms = previous.start_ms + previous.duration_ms
+            current.anchor_seq = previous.anchor_seq
+            current.anchor_pdt_ms = previous.anchor_pdt_ms
     for index in range(len(segments) - 2, -1, -1):
         current = segments[index]
         following = segments[index + 1]
         if current.start_ms is None and following.start_ms is not None:
             current.start_ms = following.start_ms - current.duration_ms
+            current.anchor_seq = following.anchor_seq
+            current.anchor_pdt_ms = following.anchor_pdt_ms
 
 
 def parse_vtt(text: str) -> WebVTT:

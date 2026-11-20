@@ -38,6 +38,34 @@ uvicorn app.main:app --port 8000
 `app/hls.py` 负责解析与换算，`app/timeutil.py` 统一以 UTC 毫秒整数存储、以
 `...Z` 字符串展示。
 
+## 换算依据（basis）与锚点更正追查
+
+每个片段入档时都会记录片首 UTC 的**换算依据**，存在 `segments` 表三列里：
+
+* `basis_playlist`：实际采用的列表类型——`video`（视频列表）或 `subs`
+  （视频列表给不出片首时由字幕列表兜底）；
+* `basis_anchor_seq`：锚点片号——片首直接取自或由它推算的那条
+  `#EXT-X-PROGRAM-DATE-TIME` 所在片段（片段自带 PDT 时锚点是自己）；
+* `basis_anchor_pdt_ms`：入档时锚点的 PDT 值（UTC 毫秒）。
+
+规则：
+
+* 待补（pending）片段每次观察列表都刷新片首与依据——**即使片首 UTC 没变，
+  改用新锚点也会更新来源**；已取（captured）片段的片首与依据都不再回写。
+* 取片成功时，依据与字幕、已取状态在同一个事务里入库；片段滑出窗口后迟到
+  补齐时，沿用滑出前最后一次观察记下的依据。
+* 依据随 SQLite 持久化：回放旧列表、重启服务后，追查仍按入档时的依据作答。
+
+直播源更正一条 PDT 后，在归档页“锚点更正追查”面板选频道、列表类型，填锚点
+片号及更正前后的 UTC，即可查出**直接使用该锚点或由它推算片首的已取片**：
+每片显示片首归档 UTC 和字幕应平移的毫秒数（= 锚点新 UTC − 原 UTC）。
+查询只匹配入档时锚点原值与所填“更正前 UTC”一致的片段；同频道里缺依据的
+旧片单列为“未知”，需人工核查。该查询为只读，不改档案。
+
+演示：演示源控制面板可把“PDT 间隔”设为每 N 片一条（其余片首由锚点推算），
+再用“更正该片 PDT”模拟源方更正——更正前后的 UTC 会自动填入追查表单。
+把锚点推进窗口之外（“推进 8 片”）再更正，即可演示锚点滑出窗口后的追查。
+
 ## 片段状态与“待补 / 缺失”
 
 片段状态是单调的，`app/db.py` 只允许下列方向：
@@ -69,9 +97,12 @@ SQLite 事务快照中完成）。
 | POST | `/api/channels/{id}/capture` | 采集一次该频道 |
 | GET | `/api/channels/{id}/archive?from=&to=` | 按 UTC 区间查档（ISO-8601，带 `Z`） |
 | GET | `/api/channels/{id}/segments` | 全部片段的完整状态 |
+| GET | `/api/channels/{id}/anchor-impact?playlist=&anchor_seq=&original=&corrected=` | 锚点更正追查（只读）：列出受影响的已取片及字幕平移量，缺依据旧片单列未知 |
 | GET/POST | `/api/demo/{path}` | 转发到演示源 `/__control/*` |
 
-演示源控制：`/__control/state`、`advance`、`latency`、`gap`、`freeze`、`stale`、`reset`。
+演示源控制：`/__control/state`、`advance`、`latency`、`gap`、`freeze`、`stale`、
+`pdt-every`（PDT 间隔，可按 `playlist=video/subs` 分设）、`pdt-shift`（更正某片
+PDT，返回更正前后 UTC）、`reset`。
 
 ## 配置
 
@@ -91,4 +122,5 @@ python3 -m pytest -q
 
 测试直接在同一进程内跑演示源与被测网页（ASGI transport），覆盖：UTC 换算、
 跨片字幕合并与缺口不合并、空字幕片段、切台、待补→缺失、迟到补齐、重复采集、
-旧列表不回退、SQLite 重启续采、按 UTC 区间过滤。
+旧列表不回退、SQLite 重启续采、按 UTC 区间过滤、锚点依据的记录/推算/滑出后
+追查、字幕列表兜底、缺依据旧片单列未知、追查只读。

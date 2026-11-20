@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS segments (
     first_seen_ms INTEGER NOT NULL,
     captured_ms  INTEGER,
     last_error   TEXT,
+    basis_playlist    TEXT,
+    basis_anchor_seq  INTEGER,
+    basis_anchor_pdt_ms INTEGER,
     PRIMARY KEY (channel_id, seq)
 );
 
@@ -81,6 +84,18 @@ CREATE INDEX IF NOT EXISTS ix_cues_channel_time ON cues(channel_id, start_ms);
 CREATE INDEX IF NOT EXISTS ix_segments_channel_time ON segments(channel_id, start_ms);
 """
 
+#: Columns added after the first deployment.  ``CREATE TABLE IF NOT EXISTS``
+#: leaves pre-existing databases alone, so the columns are added explicitly.
+_MIGRATIONS = (
+    ("segments", "basis_playlist", "ALTER TABLE segments ADD COLUMN basis_playlist TEXT"),
+    ("segments", "basis_anchor_seq", "ALTER TABLE segments ADD COLUMN basis_anchor_seq INTEGER"),
+    (
+        "segments",
+        "basis_anchor_pdt_ms",
+        "ALTER TABLE segments ADD COLUMN basis_anchor_pdt_ms INTEGER",
+    ),
+)
+
 
 @dataclass
 class SegmentRow:
@@ -94,10 +109,23 @@ class SegmentRow:
     first_seen_ms: int
     captured_ms: Optional[int]
     last_error: Optional[str]
+    #: How ``start_ms`` was derived when the segment was last observed:
+    #: which playlist supplied it, which segment's PDT anchored it, and
+    #: that anchor's PDT value at the time.  ``None`` for rows archived
+    #: before this bookkeeping existed.
+    basis_playlist: Optional[str] = None
+    basis_anchor_seq: Optional[int] = None
+    basis_anchor_pdt_ms: Optional[int] = None
 
     @property
     def duration_ms(self) -> int:
         return self.end_ms - self.start_ms
+
+    @property
+    def basis(self) -> Optional[tuple[str, int, int]]:
+        if self.basis_playlist is None or self.basis_anchor_seq is None:
+            return None
+        return (self.basis_playlist, self.basis_anchor_seq, self.basis_anchor_pdt_ms)
 
 
 @dataclass
@@ -130,6 +158,9 @@ def _row_to_segment(row: sqlite3.Row) -> SegmentRow:
         first_seen_ms=row["first_seen_ms"],
         captured_ms=row["captured_ms"],
         last_error=row["last_error"],
+        basis_playlist=row["basis_playlist"],
+        basis_anchor_seq=row["basis_anchor_seq"],
+        basis_anchor_pdt_ms=row["basis_anchor_pdt_ms"],
     )
 
 
@@ -141,6 +172,17 @@ class Database:
         self._write_lock = threading.RLock()
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add columns that post-date the first schema to existing files."""
+        for table, column, ddl in _MIGRATIONS:
+            columns = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in columns:
+                conn.execute(ddl)
 
     @contextmanager
     def connect(self):
@@ -216,7 +258,9 @@ class Database:
         """Register playlist segments and slide out pending ones.
 
         ``segments`` are dicts with ``seq``, ``start_ms``, ``end_ms`` and
-        ``sub_uri``.  Returns ``(stale, newly_missing)``.  A playlist whose
+        ``sub_uri``; they may also carry the derivation basis as
+        ``basis_playlist`` / ``basis_anchor_seq`` / ``basis_anchor_pdt_ms``.
+        Returns ``(stale, newly_missing)``.  A playlist whose
         window ends before the highest window end ever observed is considered
         stale: it may add newly seen segments but it never marks anything
         missing and never lowers the high-water marks.
@@ -243,8 +287,9 @@ class Database:
                         """
                         INSERT INTO segments(
                             channel_id, seq, start_ms, end_ms, sub_uri, status,
-                            captions_empty, first_seen_ms
-                        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                            captions_empty, first_seen_ms,
+                            basis_playlist, basis_anchor_seq, basis_anchor_pdt_ms
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                         """,
                         (
                             channel_id,
@@ -254,20 +299,32 @@ class Database:
                             segment["sub_uri"],
                             STATUS_PENDING,
                             now,
+                            segment.get("basis_playlist"),
+                            segment.get("basis_anchor_seq"),
+                            segment.get("basis_anchor_pdt_ms"),
                         ),
                     )
                 elif row["status"] == STATUS_PENDING:
-                    # Refresh transport details but never touch captures.
+                    # Refresh transport details but never touch captures.  The
+                    # basis columns follow the same rule as the start time:
+                    # they are rewritten on every observation, so a pending
+                    # segment that switches to a different anchor updates its
+                    # recorded basis even when the start UTC itself is
+                    # unchanged.
                     conn.execute(
                         """
                         UPDATE segments
-                           SET start_ms=?, end_ms=?, sub_uri=?
+                           SET start_ms=?, end_ms=?, sub_uri=?,
+                               basis_playlist=?, basis_anchor_seq=?, basis_anchor_pdt_ms=?
                          WHERE channel_id=? AND seq=? AND status=?
                         """,
                         (
                             segment["start_ms"],
                             segment["end_ms"],
                             segment["sub_uri"],
+                            segment.get("basis_playlist"),
+                            segment.get("basis_anchor_seq"),
+                            segment.get("basis_anchor_pdt_ms"),
                             channel_id,
                             segment["seq"],
                             STATUS_PENDING,
@@ -310,8 +367,17 @@ class Database:
         cues: Iterable[CueRow],
         captions_empty: bool,
         now: int,
+        basis: Optional[tuple[str, int, Optional[int]]] = None,
     ) -> bool:
-        """Atomically store a segment's cues and mark it captured."""
+        """Atomically store a segment's cues and mark it captured.
+
+        ``basis`` is the derivation basis the capture actually used
+        ``(playlist, anchor_seq, anchor_pdt_ms)``; when given it is stored
+        alongside the cues and the captured status.  A late capture of a
+        segment that already slid out of the window passes the basis kept
+        from its last playlist observation, so the conversion record
+        survives the slide-out.
+        """
         with self._write_lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -334,14 +400,34 @@ class Database:
                     for cue in cues
                 ],
             )
-            conn.execute(
-                """
-                UPDATE segments
-                   SET status=?, captions_empty=?, captured_ms=?, last_error=NULL
-                 WHERE channel_id=? AND seq=?
-                """,
-                (STATUS_CAPTURED, int(captions_empty), now, channel_id, seq),
-            )
+            if basis is not None:
+                conn.execute(
+                    """
+                    UPDATE segments
+                       SET status=?, captions_empty=?, captured_ms=?, last_error=NULL,
+                           basis_playlist=?, basis_anchor_seq=?, basis_anchor_pdt_ms=?
+                     WHERE channel_id=? AND seq=?
+                    """,
+                    (
+                        STATUS_CAPTURED,
+                        int(captions_empty),
+                        now,
+                        basis[0],
+                        basis[1],
+                        basis[2],
+                        channel_id,
+                        seq,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE segments
+                       SET status=?, captions_empty=?, captured_ms=?, last_error=NULL
+                     WHERE channel_id=? AND seq=?
+                    """,
+                    (STATUS_CAPTURED, int(captions_empty), now, channel_id, seq),
+                )
             conn.execute("COMMIT")
         return True
 
@@ -405,6 +491,48 @@ class Database:
                  ORDER BY seq
                 """,
                 (channel_id, STATUS_PENDING, STATUS_MISSING),
+            ).fetchall()
+        return [_row_to_segment(row) for row in rows]
+
+    def captured_by_anchor(
+        self,
+        channel_id: str,
+        playlist: str,
+        anchor_seq: int,
+        anchor_pdt_ms: int,
+    ) -> list[SegmentRow]:
+        """Captured segments whose archived start derives from one PDT line.
+
+        Matches the basis recorded at archive time: the playlist that
+        supplied the start, the anchor segment, and the anchor's PDT value
+        back then.  Segments archived against a different (e.g. already
+        re-corrected) anchor value do not match.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM segments
+                 WHERE channel_id=? AND status=?
+                   AND basis_playlist=? AND basis_anchor_seq=? AND basis_anchor_pdt_ms=?
+                 ORDER BY seq
+                """,
+                (channel_id, STATUS_CAPTURED, playlist, anchor_seq, anchor_pdt_ms),
+            ).fetchall()
+        return [_row_to_segment(row) for row in rows]
+
+    def captured_without_basis(self, channel_id: str) -> list[SegmentRow]:
+        """Captured segments with no recorded derivation basis (legacy rows)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM segments
+                 WHERE channel_id=? AND status=?
+                   AND (basis_playlist IS NULL
+                        OR basis_anchor_seq IS NULL
+                        OR basis_anchor_pdt_ms IS NULL)
+                 ORDER BY seq
+                """,
+                (channel_id, STATUS_CAPTURED),
             ).fetchall()
         return [_row_to_segment(row) for row in rows]
 

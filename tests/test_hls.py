@@ -70,6 +70,54 @@ seg/2.ts
     ]
 
 
+def test_segments_carry_their_pdt_anchor():
+    playlist = parse_media_playlist(VIDEO_PLAYLIST, "http://origin/channel/news/video.m3u8")
+    # Every segment has its own PDT, so each is its own anchor.
+    assert [segment.anchor_seq for segment in playlist.segments] == [10, 11, 12]
+    assert [segment.anchor_pdt_ms for segment in playlist.segments] == [
+        segment.start_ms for segment in playlist.segments
+    ]
+
+
+def test_derived_segments_inherit_the_anchor_they_came_from():
+    text = """#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:4
+#EXT-X-PROGRAM-DATE-TIME:2026-11-20T00:00:24.000Z
+#EXTINF:6.000,
+seg/4.ts
+#EXTINF:6.000,
+seg/5.ts
+#EXTINF:6.000,
+seg/6.ts
+#EXT-X-PROGRAM-DATE-TIME:2026-11-20T00:00:42.000Z
+#EXTINF:6.000,
+seg/7.ts
+"""
+    playlist = parse_media_playlist(text, "http://origin/video.m3u8")
+    assert [segment.anchor_seq for segment in playlist.segments] == [4, 4, 4, 7]
+    assert playlist.segments[1].anchor_pdt_ms == parse_iso_ms("2026-11-20T00:00:24.000Z")
+    assert playlist.segments[2].start_ms == parse_iso_ms("2026-11-20T00:00:36.000Z")
+
+
+def test_backward_derived_segments_inherit_the_following_anchor():
+    text = """#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:4
+#EXTINF:6.000,
+seg/4.ts
+#EXTINF:6.000,
+seg/5.ts
+#EXT-X-PROGRAM-DATE-TIME:2026-11-20T00:00:36.000Z
+#EXTINF:6.000,
+seg/6.ts
+"""
+    playlist = parse_media_playlist(text, "http://origin/video.m3u8")
+    assert [segment.anchor_seq for segment in playlist.segments] == [6, 6, 6]
+    assert playlist.segments[0].start_ms == parse_iso_ms("2026-11-20T00:00:24.000Z")
+    assert playlist.segments[0].anchor_pdt_ms == parse_iso_ms("2026-11-20T00:00:36.000Z")
+
+
 def test_parse_master_prefers_subtitle_rendition():
     text = """#EXTM3U
 #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="中文",DEFAULT=YES,URI="subs.m3u8"

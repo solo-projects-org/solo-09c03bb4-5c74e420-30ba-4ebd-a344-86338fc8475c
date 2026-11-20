@@ -276,6 +276,127 @@ function renderGaps(view) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Anchor correction trace (read-only)                                */
+/* ------------------------------------------------------------------ */
+function fmtShift(ms) {
+  const sign = ms > 0 ? "+" : ms < 0 ? "−" : "±";
+  return `${sign}${Math.abs(ms)} ms`;
+}
+
+function renderAnchorImpact(payload) {
+  const node = $("#anchor-result");
+  const query = payload.query;
+  const playlistLabel = query.playlist === "video" ? "视频列表" : "字幕列表";
+  const children = [
+    el("div", { class: "row", style: "margin-bottom:8px" }, [
+      el("span", {
+        class: "hint",
+        text:
+          `${playlistLabel}锚点 #${query.anchor_seq}：` +
+          `${query.original_utc} → ${query.corrected_utc}，` +
+          `字幕整体平移 ${fmtShift(query.offset_ms)}。` +
+          `共 ${payload.affected.length} 个已取片按入档时的依据匹配。`,
+      }),
+    ]),
+  ];
+
+  if (payload.affected.length) {
+    children.push(
+      el("div", { class: "table-wrap", style: "max-height:260px" }, [
+        el("table", {}, [
+          el("thead", {}, [
+            el("tr", {}, [
+              el("th", { text: "片号", style: "width:10%" }),
+              el("th", { text: "片首归档 UTC", style: "width:30%" }),
+              el("th", { text: "字幕应平移", style: "width:18%" }),
+              el("th", { text: "与锚点关系" }),
+            ]),
+          ]),
+          el(
+            "tbody",
+            {},
+            payload.affected.map((segment) =>
+              el("tr", {}, [
+                el("td", { class: "time", text: `#${segment.seq}` }),
+                el("td", { class: "time", text: segment.start_utc }),
+                el("td", { class: "time", text: fmtShift(segment.shift_ms) }),
+                el("td", {}, [
+                  segment.direct ? "直接使用该锚点" : `由锚点 #${segment.basis_anchor_seq} 推算`,
+                  el("span", {
+                    class: "pill",
+                    text: `${segment.basis_playlist === "video" ? "视频" : "字幕"}列表·锚点原值 ${segment.basis_anchor_pdt_utc}`,
+                  }),
+                ]),
+              ])
+            )
+          ),
+        ]),
+      ])
+    );
+  } else {
+    children.push(
+      el("div", {
+        class: "empty-state",
+        text: "没有已取片的入档依据与该锚点（及更正前 UTC）匹配。",
+      })
+    );
+  }
+
+  if (payload.unknown.length) {
+    children.push(
+      el("div", { class: "row", style: "margin-top:10px" }, [
+        el("span", {
+          class: "hint",
+          text:
+            `另有 ${payload.unknown.length} 个已取片缺入档依据（旧数据），` +
+            "无法判定是否受影响，需人工核查：",
+        }),
+      ])
+    );
+    children.push(
+      el(
+        "div",
+        { class: "unknown-list" },
+        payload.unknown.map((segment) =>
+          el("span", {
+            class: "pill unknown",
+            text: `#${segment.seq} · ${segment.start_utc}`,
+          })
+        )
+      )
+    );
+  }
+  node.replaceChildren(...children);
+}
+
+async function runAnchorQuery() {
+  const playlist = $("#anchor-playlist").value;
+  const seq = Number($("#anchor-seq").value);
+  const original = fromInputValue($("#anchor-original").value);
+  const corrected = fromInputValue($("#anchor-corrected").value);
+  if (!Number.isInteger(seq) || seq < 0) {
+    return toast("锚点片号须为非负整数", true);
+  }
+  if (!original || !corrected) {
+    return toast("请填写更正前后的 UTC", true);
+  }
+  const params = new URLSearchParams({
+    playlist,
+    anchor_seq: String(seq),
+    original,
+    corrected,
+  });
+  try {
+    const payload = await api(
+      `/api/channels/${encodeURIComponent(state.active)}/anchor-impact?${params}`
+    );
+    renderAnchorImpact(payload);
+  } catch (error) {
+    toast(`追查失败：${error.message}`, true);
+  }
+}
+
 function renderArchive() {
   const view = state.archive;
   const meta = $("#range-meta");
@@ -318,9 +439,15 @@ function renderDemo() {
     `窗口 #${channel.window_start}–#${channel.window_end - 1}`,
     `UTC ${channel.window_start_utc} → ${channel.window_end_utc}`,
     `取片延迟 ${demo.latency_s}s`,
+    `PDT 间隔 视频${channel.video_pdt_every}/字幕${channel.subs_pdt_every}`,
     channel.frozen ? "列表已冻结" : null,
     channel.stale_by ? `列表陈旧 ${channel.stale_by} 片` : null,
     channel.gaps.length ? `缺口 #${channel.gaps.join(", #")}` : "无缺口",
+    channel.pdt_shifts.length
+      ? `已更正 ${channel.pdt_shifts
+          .map((shift) => `#${shift.seq}(${fmtShift(shift.shift_ms)})`)
+          .join(" ")}`
+      : null,
   ].filter(Boolean);
   node.textContent = parts.join(" · ");
 }
@@ -365,6 +492,7 @@ async function switchChannel(channelId) {
   renderTabs();
   $("#from").value = "";
   $("#to").value = "";
+  $("#anchor-result").replaceChildren();
   // Reset the live window for a newly selected channel.
   if (state.demo) {
     await refreshDemo();
@@ -488,6 +616,46 @@ function bindDemoControls() {
       toast("演示列表恢复实时");
     }
   });
+  $("#demo-pdt-every-set").addEventListener("click", async () => {
+    const every = Number($("#demo-pdt-every").value);
+    if (!Number.isInteger(every) || every < 0) return toast("PDT 间隔须为非负整数", true);
+    if (await demoPost("pdt-every", { channel: state.active, every })) {
+      toast(
+        every === 1
+          ? "每片都带 PDT（恢复默认）"
+          : every === 0
+            ? "列表不再输出 PDT，片首只能由另一份列表兜底"
+            : `列表每 ${every} 片带一条 PDT，其余片首由锚点推算；重采后生效`
+      );
+    }
+  });
+  $("#demo-pdt-shift-set").addEventListener("click", async () => {
+    const seq = Number($("#demo-pdt-seq").value);
+    const shift = Number($("#demo-pdt-shift").value);
+    if (!Number.isInteger(seq) || seq < 0) return toast("片号须为非负整数", true);
+    if (!Number.isFinite(shift)) return toast("平移毫秒须为数字", true);
+    try {
+      const payload = await api("/api/demo/pdt-shift", {
+        method: "POST",
+        body: JSON.stringify({ channel: state.active, seq, shift_ms: shift }),
+      });
+      state.demo = payload;
+      renderDemo();
+      const info = payload.pdt_shift;
+      if (info) {
+        // Fill the trace form so the follow-up query is one click away.
+        $("#anchor-seq").value = String(info.seq);
+        $("#anchor-original").value = info.original_utc;
+        $("#anchor-corrected").value = info.corrected_utc;
+        toast(
+          `已更正 #${info.seq} 的 PDT：${info.original_utc} → ${info.corrected_utc}；` +
+            "更正前后 UTC 已填入追查表单"
+        );
+      }
+    } catch (error) {
+      toast(`演示源操作失败：${error.message}`, true);
+    }
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -528,6 +696,10 @@ async function boot() {
     $("#from").value = "";
     $("#to").value = "";
     await loadArchive();
+  });
+  $("#anchor-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await runAnchorQuery();
   });
 
   bindDemoControls();

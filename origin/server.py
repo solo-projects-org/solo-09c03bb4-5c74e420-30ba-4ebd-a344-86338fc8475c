@@ -8,7 +8,9 @@ web page (and the tests) to drive the simulation:
 * advance the live window,
 * add per-segment latency to file delivery,
 * make chosen segments unavailable (HTTP 404) and let them arrive later,
-* freeze a playlist to imitate a stale CDN cache.
+* freeze a playlist to imitate a stale CDN cache,
+* emit ``EXT-X-PROGRAM-DATE-TIME`` only on every Nth segment so the other
+  starts must be derived from an anchor, and issue PDT corrections.
 """
 from __future__ import annotations
 
@@ -52,6 +54,15 @@ class OriginChannel:
     #: Serve a playlist this many segments behind the live head, imitating a
     #: stale CDN cache.  ``0`` means a live playlist.
     stale_by: int = 0
+    #: Emit ``EXT-X-PROGRAM-DATE-TIME`` only on every Nth segment of each
+    #: playlist (0 = never); the other segments must be derived from the
+    #: nearest anchor by the archiver.  ``1`` anchors every segment.
+    video_pdt_every: int = 1
+    subs_pdt_every: int = 1
+    #: PDT corrections issued by the "broadcaster": seq -> shift in ms added
+    #: to the segment's original start.  Applied to playlists (and to the
+    #: subtitle files' LOCAL clock) from the moment they are set.
+    pdt_shifts: dict[int, int] = field(default_factory=dict)
 
     @property
     def served_head(self) -> int:
@@ -66,6 +77,10 @@ class OriginChannel:
         return range(self.window_start, self.served_head)
 
     def start_ms(self, seq: int) -> int:
+        return self.base_ms + seq * SEG_MS + self.pdt_shifts.get(seq, 0)
+
+    def original_start_ms(self, seq: int) -> int:
+        """The start the segment would have without any PDT correction."""
         return self.base_ms + seq * SEG_MS
 
     def cues(self, seq: int) -> list[tuple[int, int, str]]:
@@ -165,7 +180,8 @@ def _video_playlist(channel: OriginChannel, base_url: str) -> str:
         f"#EXT-X-MEDIA-SEQUENCE:{channel.window_start}",
     ]
     for seq in channel.window:
-        lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{iso_from_ms(channel.start_ms(seq))}")
+        if _has_pdt(channel.video_pdt_every, seq):
+            lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{iso_from_ms(channel.start_ms(seq))}")
         lines.append(f"#EXTINF:{SEG_MS / 1000:.3f},")
         lines.append(f"seg/{seq}.ts")
     return "\n".join(lines) + "\n"
@@ -181,10 +197,15 @@ def _subs_playlist(channel: OriginChannel, base_url: str) -> str:
         f"#EXT-X-MEDIA-SEQUENCE:{channel.window_start}",
     ]
     for seq in channel.window:
-        lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{iso_from_ms(channel.start_ms(seq))}")
+        if _has_pdt(channel.subs_pdt_every, seq):
+            lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{iso_from_ms(channel.start_ms(seq))}")
         lines.append(f"#EXTINF:{SEG_MS / 1000:.3f},")
         lines.append(f"subs/{seq}.vtt")
     return "\n".join(lines) + "\n"
+
+
+def _has_pdt(every: int, seq: int) -> bool:
+    return every > 0 and seq % every == 0
 
 
 def _subtitle_file(channel: OriginChannel, seq: int) -> str:
@@ -228,6 +249,19 @@ class FreezeRequest(BaseModel):
 class StaleRequest(BaseModel):
     channel: Optional[str] = None
     segments: int = 8
+
+
+class PdtEveryRequest(BaseModel):
+    channel: str
+    every: int
+    #: Which playlist to change; omit to change both.
+    playlist: Optional[str] = None
+
+
+class PdtShiftRequest(BaseModel):
+    channel: str
+    seq: int
+    shift_ms: int
 
 
 def create_app() -> FastAPI:
@@ -323,12 +357,26 @@ def create_app() -> FastAPI:
                     "window_end_utc": iso_from_ms(channel.start_ms(channel.served_head)),
                     "gaps": sorted(channel.gaps),
                     "frozen": channel.frozen_video is not None,
+                    "video_pdt_every": channel.video_pdt_every,
+                    "subs_pdt_every": channel.subs_pdt_every,
+                    "pdt_shifts": [
+                        {
+                            "seq": seq,
+                            "shift_ms": shift,
+                            "original_utc": iso_from_ms(channel.original_start_ms(seq)),
+                            "corrected_utc": iso_from_ms(channel.start_ms(seq)),
+                        }
+                        for seq, shift in sorted(channel.pdt_shifts.items())
+                        if shift
+                    ],
                     "segments": [
                         {
                             "seq": seq,
                             "start_utc": iso_from_ms(channel.start_ms(seq)),
                             "available": seq not in channel.gaps,
                             "empty_captions": _is_empty_segment(seq),
+                            "video_pdt": _has_pdt(channel.video_pdt_every, seq),
+                            "subs_pdt": _has_pdt(channel.subs_pdt_every, seq),
                         }
                         for seq in channel.window
                     ],
@@ -390,6 +438,44 @@ def create_app() -> FastAPI:
             channel.frozen_video = None
             channel.frozen_subs = None
         return await control_state()
+
+    @app.post("/__control/pdt-every")
+    async def pdt_every(body: PdtEveryRequest) -> dict:
+        if not 0 <= body.every <= 1000:
+            raise HTTPException(status_code=400, detail="every must be 0..1000")
+        if body.playlist not in (None, "video", "subs"):
+            raise HTTPException(status_code=400, detail="playlist must be video or subs")
+        channel = SIM.get(body.channel)
+        if body.playlist in (None, "video"):
+            channel.video_pdt_every = body.every
+        if body.playlist in (None, "subs"):
+            channel.subs_pdt_every = body.every
+        return await control_state()
+
+    @app.post("/__control/pdt-shift")
+    async def pdt_shift(body: PdtShiftRequest) -> dict:
+        """Issue a PDT correction for one segment, as the broadcaster would.
+
+        The response describes the correction so the archive page can fill in
+        its trace form: the anchor's UTC before and after the correction.
+        """
+        if not -DAY_MS <= body.shift_ms <= DAY_MS:
+            raise HTTPException(status_code=400, detail="shift_ms must be within ±1 day")
+        channel = SIM.get(body.channel)
+        original_ms = channel.original_start_ms(body.seq)
+        if body.shift_ms:
+            channel.pdt_shifts[body.seq] = body.shift_ms
+        else:
+            channel.pdt_shifts.pop(body.seq, None)
+        state = await control_state()
+        state["pdt_shift"] = {
+            "channel": channel.id,
+            "seq": body.seq,
+            "shift_ms": body.shift_ms,
+            "original_utc": iso_from_ms(original_ms),
+            "corrected_utc": iso_from_ms(original_ms + body.shift_ms),
+        }
+        return state
 
     @app.post("/__control/reset")
     async def reset() -> dict:

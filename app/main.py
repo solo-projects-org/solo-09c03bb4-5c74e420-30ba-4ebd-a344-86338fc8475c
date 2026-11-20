@@ -170,6 +170,75 @@ def create_app(
             ]
         }
 
+    @app.get("/api/channels/{channel_id}/anchor-impact")
+    async def anchor_impact(
+        channel_id: str,
+        playlist: str,
+        anchor_seq: int,
+        original: str,
+        corrected: str,
+    ):
+        """Trace a corrected ``EXT-X-PROGRAM-DATE-TIME`` to archived cues.
+
+        Read-only: answers purely from the derivation basis recorded at
+        archive time and never rewrites anything.  ``original``/``corrected``
+        are the anchor's UTC before/after the source's correction; every
+        affected segment's cues shift by ``corrected - original``.
+        """
+        channel = channel_or_404(channel_id)
+        if playlist not in ("video", "subs"):
+            raise HTTPException(
+                status_code=400,
+                detail="playlist must be 'video' or 'subs'",
+            )
+        if anchor_seq < 0:
+            raise HTTPException(status_code=400, detail="anchor_seq must be >= 0")
+        original_ms = _parse_time(original)
+        corrected_ms = _parse_time(corrected)
+        if original_ms is None or corrected_ms is None:
+            raise HTTPException(
+                status_code=400, detail="original and corrected UTC are required"
+            )
+        offset_ms = corrected_ms - original_ms
+
+        affected = database.captured_by_anchor(
+            channel_id, playlist, anchor_seq, original_ms
+        )
+        unknown = database.captured_without_basis(channel_id)
+        return {
+            "channel": {"id": channel_id, "name": channel["name"]},
+            "query": {
+                "playlist": playlist,
+                "anchor_seq": anchor_seq,
+                "original_ms": original_ms,
+                "original_utc": iso_from_ms(original_ms),
+                "corrected_ms": corrected_ms,
+                "corrected_utc": iso_from_ms(corrected_ms),
+                "offset_ms": offset_ms,
+            },
+            "affected": [
+                {
+                    "seq": segment.seq,
+                    "start_ms": segment.start_ms,
+                    "start_utc": iso_from_ms(segment.start_ms),
+                    "shift_ms": offset_ms,
+                    "direct": segment.seq == anchor_seq,
+                    "basis_playlist": segment.basis_playlist,
+                    "basis_anchor_seq": segment.basis_anchor_seq,
+                    "basis_anchor_pdt_utc": iso_from_ms(segment.basis_anchor_pdt_ms),
+                }
+                for segment in affected
+            ],
+            "unknown": [
+                {
+                    "seq": segment.seq,
+                    "start_ms": segment.start_ms,
+                    "start_utc": iso_from_ms(segment.start_ms),
+                }
+                for segment in unknown
+            ],
+        }
+
     # ------------------------------------------------------------------
     # Demo origin control proxy
     # ------------------------------------------------------------------

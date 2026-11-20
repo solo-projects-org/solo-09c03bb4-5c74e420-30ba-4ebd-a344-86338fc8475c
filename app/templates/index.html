@@ -78,6 +78,34 @@
       </div>
     </section>
 
+    <section class="panel">
+      <p class="section-title">锚点更正追查（只读核查，不改档案）</p>
+      <form class="row" id="anchor-form">
+        <label class="field">
+          列表类型
+          <select id="anchor-playlist">
+            <option value="video">视频列表</option>
+            <option value="subs">字幕列表</option>
+          </select>
+        </label>
+        <label class="field">
+          锚点片号
+          <input type="number" id="anchor-seq" min="0" step="1" value="4" style="min-width:90px">
+        </label>
+        <label class="field">
+          更正前 UTC（锚点原 PDT）
+          <input type="text" id="anchor-original" placeholder="2026-11-20T00:00:24.000Z" autocomplete="off">
+        </label>
+        <label class="field">
+          更正后 UTC（锚点新 PDT）
+          <input type="text" id="anchor-corrected" placeholder="2026-11-20T00:00:26.500Z" autocomplete="off">
+        </label>
+        <button class="btn" type="submit">查受影响字幕</button>
+        <span class="hint">直播源更正一条 EXT-X-PROGRAM-DATE-TIME 后，查哪些已取片的字幕播出时间要跟着平移。</span>
+      </form>
+      <div id="anchor-result" style="margin-top:10px"></div>
+    </section>
+
     <section class="panel demo">
       <div class="title" style="margin-bottom:10px">
         <span class="dot"></span>
@@ -96,9 +124,28 @@
           <input type="number" id="demo-latency" min="0" max="30" step="0.5" value="0">
         </label>
       </div>
+      <div class="row">
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">
+          PDT 间隔（每 N 片一条）
+          <input type="number" id="demo-pdt-every" min="0" max="64" step="1" value="1">
+        </label>
+        <button class="btn" id="demo-pdt-every-set">设置 PDT 间隔</button>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">
+          更正片号
+          <input type="number" id="demo-pdt-seq" min="0" step="1" value="4" style="min-width:80px">
+        </label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">
+          平移毫秒
+          <input type="number" id="demo-pdt-shift" step="100" value="2500" style="min-width:100px">
+        </label>
+        <button class="btn" id="demo-pdt-shift-set">更正该片 PDT</button>
+      </div>
       <div class="row"><span class="hint" id="demo-state"></span></div>
       <div class="row">
         <span class="hint">“让下一片取片失败”作用于下一个进窗口的片段：取片返回 404（视为未采到），推进窗口并采集后标为待补，滑出窗口后标为缺失；“恢复全部缺口”后再采集即为迟到补齐。推进窗口与失败/恢复都会自动跟随一次采集。</span>
+      </div>
+      <div class="row">
+        <span class="hint">“PDT 间隔”让列表只在每 N 片带 EXT-X-PROGRAM-DATE-TIME，其余片首由锚点推算（0 表示该列表完全不带，字幕列表可单独兜底）。“更正该片 PDT”模拟源方事后更正：把更正前后的 UTC 填入上方追查表单即可查受影响的已归档字幕——即使锚点已滑出窗口。</span>
       </div>
     </section>
   </main>
